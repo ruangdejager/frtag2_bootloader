@@ -1,0 +1,70 @@
+# Makefile.cli
+#
+# CLI build for frtag2_bootloader — verification build outside CubeIDE.
+# CubeIDE's own Debug/ build (via .cproject) is the normal way to build this
+# project; this file just lets the build be checked without the IDE.
+
+TARGET   = frtag2_bootloader
+BUILD    = build
+
+CC       = arm-none-eabi-gcc
+OBJCOPY  = arm-none-eabi-objcopy
+SIZE     = arm-none-eabi-size
+
+LDSCRIPT = STM32WLE5CCUX_FLASH.ld
+
+C_SRCS := $(wildcard Core/Src/*.c) \
+          $(wildcard Hal/src/*.c) \
+          $(wildcard fr_bootloader/src/*.c) \
+          $(wildcard Drivers/STM32WLxx_HAL_Driver/Src/*.c)
+S_SRCS := Core/Startup/startup_stm32wle5ccux.s
+
+INCLUDES = -ICore/Inc -IHal -IHal/inc -Ifr_bootloader/inc \
+           -IDrivers/STM32WLxx_HAL_Driver/Inc \
+           -IDrivers/STM32WLxx_HAL_Driver/Inc/Legacy \
+           -IDrivers/CMSIS/Device/ST/STM32WLxx/Include \
+           -IDrivers/CMSIS/Include
+
+DEFS = -DCORE_CM4 -DUSE_HAL_DRIVER -DSTM32WLE5xx
+
+CFLAGS = -mcpu=cortex-m4 -std=gnu11 -g3 -O0 $(DEFS) $(INCLUDES) \
+         -ffunction-sections -fdata-sections -Wall \
+         --specs=nano.specs -mfloat-abi=soft -mthumb
+
+ASFLAGS = -mcpu=cortex-m4 -x assembler-with-cpp -mfloat-abi=soft -mthumb
+
+LDFLAGS = -mcpu=cortex-m4 -T$(LDSCRIPT) --specs=nosys.specs \
+          -Wl,--gc-sections -static --specs=nano.specs \
+          -mfloat-abi=soft -mthumb \
+          -Wl,-Map=$(BUILD)/$(TARGET).map \
+          -Wl,--start-group -lc -lm -Wl,--end-group
+
+C_OBJS  = $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
+S_OBJS  = $(patsubst %.s,$(BUILD)/%.o,$(S_SRCS))
+OBJS    = $(C_OBJS) $(S_OBJS)
+
+all: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).bin $(BUILD)/$(TARGET).hex
+	$(SIZE) $(BUILD)/$(TARGET).elf
+
+$(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/%.o: %.s
+	@mkdir -p $(dir $@)
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BUILD)/$(TARGET).elf: $(OBJS)
+	@mkdir -p $(BUILD)
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
+
+$(BUILD)/$(TARGET).bin: $(BUILD)/$(TARGET).elf
+	$(OBJCOPY) -O binary $< $@
+
+$(BUILD)/$(TARGET).hex: $(BUILD)/$(TARGET).elf
+	$(OBJCOPY) -O ihex $< $@
+
+clean:
+	rm -rf $(BUILD)
+
+.PHONY: all clean

@@ -41,12 +41,20 @@ _estack = ORIGIN(RAM) + LENGTH(RAM); /* end of "RAM" Ram type memory */
 _Min_Heap_Size = 0x200; /* required amount of heap  */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
-/* Memories definition */
+/* Memories definition.
+ *
+ * This bootloader occupies only the first 20 KB of internal flash
+ * (0x08000000-0x08004FFF); the frtag2 application links at 0x08005000.
+ * These numbers must stay in sync with OTA_BOOTLOADER_SIZE / OTA_APP_BASE_ADDR
+ * in fr_bootloader/inc/OtaStore_Config.h (and frtag2's own copy of the same
+ * file, and its STM32WLE5CCUX_FLASH.ld).
+ */
+BOOTLOADER_SIZE = 20K;
+
 MEMORY
 {
   RAM    (xrw)   : ORIGIN = 0x20000000, LENGTH = 64K
-  RAM2   (xrw)   : ORIGIN = 0x10000000, LENGTH = 32K
-  FLASH   (rx)   : ORIGIN = 0x08000000, LENGTH = 256K
+  FLASH   (rx)   : ORIGIN = 0x08000000, LENGTH = BOOTLOADER_SIZE
 }
 
 /* Sections */

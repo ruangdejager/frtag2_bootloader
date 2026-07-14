@@ -33,8 +33,13 @@
 /**
   * @brief This is the list of modules to be used in the HAL driver
   */
+/* Trimmed for frtag2_bootloader: only the modules the bootloader actually
+ * uses. No RTOS (USE_RTOS below), no ADC/UART/TIM/EXTI (unused peripherals
+ * from frtag2's board pinout) — just clocks/GPIO/PWR/CORTEX for boot, FLASH
+ * for internal-flash programming, SPI for the external NOR flash, RTC for
+ * the TAMP backup registers, and IWDG to kick during the erase/program loop. */
 #define HAL_MODULE_ENABLED
-#define HAL_ADC_MODULE_ENABLED
+/*#define HAL_ADC_MODULE_ENABLED   */
 /*#define HAL_COMP_MODULE_ENABLED   */
 /*#define HAL_CRC_MODULE_ENABLED   */
 /*#define HAL_CRYP_MODULE_ENABLED   */
@@ -45,7 +50,7 @@
 /*#define HAL_I2S_MODULE_ENABLED   */
 /*#define HAL_IPCC_MODULE_ENABLED   */
 /*#define HAL_IRDA_MODULE_ENABLED   */
-/*#define HAL_IWDG_MODULE_ENABLED   */
+#define HAL_IWDG_MODULE_ENABLED
 /*#define HAL_LPTIM_MODULE_ENABLED   */
 /*#define HAL_PKA_MODULE_ENABLED   */
 /*#define HAL_RNG_MODULE_ENABLED   */
@@ -54,11 +59,11 @@
 /*#define HAL_SMBUS_MODULE_ENABLED   */
 #define HAL_SPI_MODULE_ENABLED
 /*#define HAL_SUBGHZ_MODULE_ENABLED   */
-#define HAL_TIM_MODULE_ENABLED
-#define HAL_UART_MODULE_ENABLED
+/*#define HAL_TIM_MODULE_ENABLED   */
+/*#define HAL_UART_MODULE_ENABLED   */
 /*#define HAL_USART_MODULE_ENABLED   */
 /*#define HAL_WWDG_MODULE_ENABLED   */
-#define HAL_EXTI_MODULE_ENABLED
+/*#define HAL_EXTI_MODULE_ENABLED   */
 #define HAL_CORTEX_MODULE_ENABLED
 #define HAL_DMA_MODULE_ENABLED
 #define HAL_FLASH_MODULE_ENABLED
