@@ -37,7 +37,9 @@
 #include "Flash.h"
 #include "OtaStore_Config.h"
 
-#define BOOTLOADER_VERSION   1U
+/* Read by build_scripts/create_release_hex_files.ps1 (regex '_BL_VER\s+(\d+)',
+ * same convention as fr9_bootloader) to name the release hex. */
+#define FRTAG_BL_VER   1U
 
 #define INTERNAL_FLASH_PAGE_SIZE   2048UL
 
@@ -279,7 +281,7 @@ int main(void)
     /* Record the bootloader's own version on every boot (own register —
      * distinct from BKP0R/BKP1R, which are the app<->bootloader OTA
      * handoff flag/version per OtaStore_Config.h). */
-    TAMP->BKP2R = BOOTLOADER_VERSION;
+    TAMP->BKP2R = FRTAG_BL_VER;
 
     HAL_SPI_vInit();
     FLASH_vInit();
