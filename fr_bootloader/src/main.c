@@ -1,30 +1,24 @@
 /*
  * main.c  (fr_bootloader/src/main.c)
  *
- * Application entry point for frtag2_bootloader — a minimal bare-metal OTA
- * bootloader for frtag2. No RTOS, no coroutines: runs once per reset,
- * polling only.
+ * frtag2 OTA bootloader. No RTOS, no coroutines: runs once per reset,
+ * polling only. Sole main() for the whole project — Core/Src/main.c
+ * doesn't exist.
  *
- * Reads the OTA image metadata from the external NOR flash (contract
- * defined in fr_bootloader/inc/OtaStore_Config.h, shared verbatim with the
- * frtag2 application), and:
- *
- *   - if the record is VALID and not yet CONSUMED, verifies its XOR-8 and
- *     programs internal flash 0x08005000..stopAddr from the scratchpad,
- *     then marks CONSUMED (a NOR 1->0 write, no erase needed);
- *   - on any mismatch, or once already CONSUMED, leaves internal flash
- *     alone.
+ * Boot flow:
+ *   1. Read the OTA metadata record from external NOR flash (layout in
+ *      Fota_Config.h, kept byte-identical between this bootloader and the
+ *      application).
+ *   2. If the record is VALID and its version is strictly newer than the
+ *      version currently installed (read directly from internal flash at
+ *      OTA_FW_INFO_ADDR — a FwVersion_t compiled into the app image itself,
+ *      see version_config.c on the app side), verify its XOR-8 and program
+ *      internal flash OTA_APP_BASE_ADDR..stopAddr from the scratchpad.
+ *   3. Jump to the application. On any check failure, jump to whatever is
+ *      already installed.
  *
  * The scratchpad image is NEVER erased here — the primary re-reads it
  * later to distribute the same image to secondaries over LoRa.
- *
- * Bootloader version is written to TAMP->BKP2R on every boot (frtag2's own
- * OTA_BOOT_MAGIC/version handshake uses BKP0R/BKP1R — see
- * OtaStore_Config.h).
- *
- * CubeMX-generated boilerplate (SystemClock_Config, MX_GPIO_Init,
- * Error_Handler) is kept in this file rather than Core/Src/main.c —
- * Core/Src/main.c does not exist in this project; this is the sole main().
  */
 
 #include <string.h>
@@ -35,10 +29,11 @@
 #include "hal_wdt.h"
 #include "hal_rtc.h"
 #include "Flash.h"
-#include "OtaStore_Config.h"
+#include "Fota_Config.h"
+#include "bl_dbg.h"
 
-/* Read by build_scripts/create_release_hex_files.ps1 (regex '_BL_VER\s+(\d+)',
- * same convention as fr9_bootloader) to name the release hex. */
+/* Read by build_scripts/create_release_hex_files.ps1 (regex '_BL_VER\s+(\d+)')
+ * to name the release hex. */
 #define FRTAG_BL_VER   1U
 
 #define INTERNAL_FLASH_PAGE_SIZE   2048UL
@@ -48,8 +43,7 @@ typedef void (*pFunction)(void);
 static uint8_t au8PageBuf[INTERNAL_FLASH_PAGE_SIZE];
 
 /* --------------------------------------------------------------------------
- * SystemClock_Config — HSI + LSE, PLL -> 48 MHz. Same tree CubeMX generated
- * for this .ioc (identical to frtag2's own clock config).
+ * SystemClock_Config — HSI + LSE, PLL -> 48 MHz.
  * -------------------------------------------------------------------------- */
 void SystemClock_Config(void)
 {
@@ -114,10 +108,8 @@ void Error_Handler(void)
 }
 
 /* --------------------------------------------------------------------------
- * OTA metadata read/verify — direct external-flash reads at the offsets
- * defined in OtaStore_Config.h. No dependency on frtag2's OtaStore.c
- * abstraction; the bootloader only ever reads this record, it never writes
- * the VALID marker (only the application does) and never erases scratch.
+ * OTA metadata read — bootloader only ever reads this record; the app
+ * writes VALID and the primary writes DISTRIBUTED.
  * -------------------------------------------------------------------------- */
 typedef struct
 {
@@ -126,7 +118,6 @@ typedef struct
     uint32_t u32SizeBytes;
     uint8_t  u8Xor8;
     bool     bValid;
-    bool     bConsumed;
 } OtaMeta_t;
 
 static uint32_t GetU32(const uint8_t *p)
@@ -150,8 +141,7 @@ static bool OTA_bGetMeta(OtaMeta_t *pt)
     pt->u32StopAddr  = GetU32(&au8Rec[OTA_META_OFF_STOP_ADDR]);
     pt->u32SizeBytes = GetU32(&au8Rec[OTA_META_OFF_SIZE]);
     pt->u8Xor8       = au8Rec[OTA_META_OFF_XOR8];
-    pt->bValid       = (au8Rec[OTA_META_OFF_VALID]    == OTA_META_MARKER);
-    pt->bConsumed    = (au8Rec[OTA_META_OFF_CONSUMED] == OTA_META_MARKER);
+    pt->bValid       = (au8Rec[OTA_META_OFF_VALID] == OTA_META_MARKER);
 
     if (pt->u32SizeBytes == 0UL || pt->u32SizeBytes > OTA_APP_MAX_SIZE)
         return false;
@@ -159,16 +149,42 @@ static bool OTA_bGetMeta(OtaMeta_t *pt)
     return pt->bValid;
 }
 
+/* Installed app version, read straight out of internal flash at the fixed
+ * address the app's own linker script places its FwVersion_t at (see
+ * version_config.c, Fota_Config.h). Internal flash is memory-mapped, so
+ * this is a plain pointer read — no driver, no RTC/backup-domain
+ * dependency (that dependency is exactly what made the older TAMP-backup-
+ * register approach unreliable: the app wrote it before the RTC clock was
+ * enabled and the write silently no-op'd).
+ *
+ * Packed into the same MMmmpp representation as meta.u32Version for a
+ * direct comparison. An erased app region reads back all-0xFF fields,
+ * which is treated as "no app installed" (0) rather than a huge version -
+ * otherwise a blank chip would appear infinitely up to date and the
+ * bootloader would never program the first image. */
+static uint32_t BL_u32GetInstalledVersion(void)
+{
+    const FwVersion_t *pt = (const FwVersion_t *)OTA_FW_INFO_ADDR;
+
+    if (pt->major == 0xFFFFU && pt->minor == 0xFFFFU && pt->patch == 0xFFFFU)
+        return 0U;
+
+    return (uint32_t)pt->major * 10000UL
+         + (uint32_t)pt->minor * 100UL
+         + (uint32_t)pt->patch;
+}
+
 static uint8_t OTA_u8CalcXor(uint32_t u32SizeBytes)
 {
     uint8_t  au8Buf[64];
-    uint8_t  u8Xor    = 0U;
-    uint32_t u32Addr  = OTA_SCRATCH_START_ADDR;
+    uint8_t  u8Xor     = 0U;
+    uint32_t u32Addr   = OTA_SCRATCH_START_ADDR;
     uint32_t u32Remain = u32SizeBytes;
 
     while (u32Remain > 0U)
     {
-        uint16_t u16Chunk = (u32Remain > sizeof(au8Buf)) ? (uint16_t)sizeof(au8Buf) : (uint16_t)u32Remain;
+        uint16_t u16Chunk = (u32Remain > sizeof(au8Buf))
+                            ? (uint16_t)sizeof(au8Buf) : (uint16_t)u32Remain;
         if (!FLASH_vRead(u32Addr, au8Buf, u16Chunk))
             return (uint8_t)~u8Xor;   /* force a mismatch on read failure */
         for (uint16_t i = 0; i < u16Chunk; i++)
@@ -180,71 +196,106 @@ static uint8_t OTA_u8CalcXor(uint32_t u32SizeBytes)
     return u8Xor;
 }
 
-static bool OTA_bMarkConsumed(void)
+/* --------------------------------------------------------------------------
+ * Internal-flash programming from scratchpad.
+ *
+ * Per-op Unlock -> CLEAR_FLAG(ALL_ERRORS) -> op (retry once) -> Lock is
+ * the same pattern frtag2's flashLog.c uses on this exact chip. Do NOT
+ * hold the flash unlocked across the whole session and do NOT skip the
+ * flag clear — the HAL treats any latched SR error (including OPTVERR
+ * left set by the option-byte load at reset) as a prior-op failure and
+ * returns HAL_ERROR without ever writing CR.
+ *
+ * LED heartbeat runs while erasing/programming so a bench operator can
+ * see the device is actually working: yellow 50 ms on / 450 ms off, then
+ * red 50 ms on / 450 ms off, alternating 1 s cycle.
+ * -------------------------------------------------------------------------- */
+static void BL_vLedHeartbeat(uint32_t u32NowMs, uint32_t u32StartMs)
 {
-    uint8_t u8Marker = OTA_META_MARKER;
-    return FLASH_vPageWrite(OTA_META_ADDR + OTA_META_OFF_CONSUMED, &u8Marker, 1U);
+    uint32_t u32Phase = (u32NowMs - u32StartMs) % 1000U;
+    /*   0..49    -> YELLOW on
+     *  50..499   -> both off
+     * 500..549   -> RED on
+     * 550..999   -> both off
+     */
+    bool bYellowOn = (u32Phase < 50U);
+    bool bRedOn    = (u32Phase >= 500U) && (u32Phase < 550U);
+    HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin, bYellowOn ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, LED_RED_Pin,    bRedOn    ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-/* --------------------------------------------------------------------------
- * Internal flash programming — erase 2 KB page(s), program 8 bytes at a
- * time (STM32WL double-word program), from the scratchpad image.
- * -------------------------------------------------------------------------- */
 static bool BL_bProgramApp(const OtaMeta_t *pt)
 {
     uint32_t u32DstAddr = OTA_APP_BASE_ADDR;
     uint32_t u32SrcAddr = OTA_SCRATCH_START_ADDR;
     uint32_t u32Remain  = pt->u32SizeBytes;
+    uint32_t u32Done    = 0U;
+    uint32_t u32StartMs = HAL_GetTick();
+    uint8_t  u8LastPct  = 0xFFU;
 
-    if (HAL_FLASH_Unlock() != HAL_OK)
-        return false;
-
-    bool bOk = true;
-
-    while (u32Remain > 0U && bOk)
+    while (u32Remain > 0U)
     {
+        BL_vLedHeartbeat(HAL_GetTick(), u32StartMs);
+
         uint16_t u16Chunk = (u32Remain > INTERNAL_FLASH_PAGE_SIZE)
-                           ? (uint16_t)INTERNAL_FLASH_PAGE_SIZE
-                           : (uint16_t)u32Remain;
+                            ? (uint16_t)INTERNAL_FLASH_PAGE_SIZE
+                            : (uint16_t)u32Remain;
 
         memset(au8PageBuf, 0xFF, sizeof(au8PageBuf));
-
-        if (!FLASH_vRead(u32SrcAddr, au8PageBuf, u16Chunk))
-        {
-            bOk = false;
-            break;
-        }
+        (void)FLASH_vRead(u32SrcAddr, au8PageBuf, u16Chunk);
 
         FLASH_EraseInitTypeDef erase = {0};
         uint32_t u32PageError = 0U;
         erase.TypeErase = FLASH_TYPEERASE_PAGES;
         erase.Page      = (u32DstAddr - FLASH_BASE) / INTERNAL_FLASH_PAGE_SIZE;
         erase.NbPages   = 1U;
-        if (HAL_FLASHEx_Erase(&erase, &u32PageError) != HAL_OK)
-        {
-            bOk = false;
-            break;
-        }
+
+        HAL_StatusTypeDef status;
+        HAL_FLASH_Unlock();
+        __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+        status = HAL_FLASHEx_Erase(&erase, &u32PageError);
+        if (status != HAL_OK)
+            status = HAL_FLASHEx_Erase(&erase, &u32PageError);
+        HAL_FLASH_Lock();
 
         for (uint32_t off = 0; off < INTERNAL_FLASH_PAGE_SIZE; off += 8U)
         {
             uint64_t u64Data;
             memcpy(&u64Data, &au8PageBuf[off], 8U);
-            if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, u32DstAddr + off, u64Data) != HAL_OK)
-            {
-                bOk = false;
-                break;
-            }
+
+            HAL_FLASH_Unlock();
+            __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+            status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                       u32DstAddr + off, u64Data);
+            if (status != HAL_OK)
+                status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
+                                           u32DstAddr + off, u64Data);
+            HAL_FLASH_Lock();
         }
 
         u32DstAddr += INTERNAL_FLASH_PAGE_SIZE;
         u32SrcAddr += u16Chunk;
         u32Remain  -= u16Chunk;
+        u32Done    += u16Chunk;
         HAL_WDT_vReset();
+
+        uint8_t u8Pct = (uint8_t)((u32Done * 100UL) / pt->u32SizeBytes);
+        if (u8LastPct == 0xFFU || u32Remain == 0U || u8Pct >= (uint8_t)(u8LastPct + 10U))
+        {
+            BL_DBG_vPuts("  programming ");
+            BL_DBG_vPutDec32(u32Done);
+            BL_DBG_vPuts("/");
+            BL_DBG_vPutDec32(pt->u32SizeBytes);
+            BL_DBG_vPuts(" B (");
+            BL_DBG_vPutDec32(u8Pct);
+            BL_DBG_vPuts("%)\r\n");
+            u8LastPct = u8Pct;
+        }
     }
 
-    HAL_FLASH_Lock();
-    return bOk;
+    HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, LED_RED_Pin,    GPIO_PIN_RESET);
+    return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -278,37 +329,76 @@ int main(void)
     HAL_WDT_vInit();
     HAL_RTC_vInitBackupDomain();
 
-    /* Record the bootloader's own version on every boot (own register —
-     * distinct from BKP0R/BKP1R, which are the app<->bootloader OTA
-     * handoff flag/version per OtaStore_Config.h). */
+    /* Own version — separate from BKP0R/BKP1R (app<->bootloader OTA handoff). */
     TAMP->BKP2R = FRTAG_BL_VER;
+
+    BL_DBG_vInit();
+    BL_DBG_vPuts("\r\n--- frtag2_bootloader v");
+    BL_DBG_vPutHex8(FRTAG_BL_VER);
+    BL_DBG_vPuts(" ---\r\n");
 
     HAL_SPI_vInit();
     FLASH_vInit();
 
     OtaMeta_t meta;
-    if (OTA_bGetMeta(&meta) && !meta.bConsumed)
+    bool bMetaOk = OTA_bGetMeta(&meta);
+
+    /* Installed app version — read directly from the app's own image in
+     * internal flash (see BL_u32GetInstalledVersion). 0 means "no app
+     * installed" (blank chip). */
+    uint32_t u32InstalledVer = BL_u32GetInstalledVersion();
+
+    BL_DBG_vPuts("meta: valid=");
+    BL_DBG_vPuts(bMetaOk ? "YES" : "NO");
+    BL_DBG_vPuts(" ver=");
+    BL_DBG_vPutDec32(bMetaOk ? meta.u32Version : 0U);
+    BL_DBG_vPuts(" installed=");
+    BL_DBG_vPutDec32(u32InstalledVer);
+    if (bMetaOk)
+    {
+        BL_DBG_vPuts(" size=");
+        BL_DBG_vPutDec32(meta.u32SizeBytes);
+        BL_DBG_vPuts(" xor=0x");
+        BL_DBG_vPutHex8(meta.u8Xor8);
+    }
+    BL_DBG_vPuts("\r\n");
+
+    if (bMetaOk && meta.u32Version > u32InstalledVer)
     {
         uint8_t u8XorCalc = OTA_u8CalcXor(meta.u32SizeBytes);
         if (u8XorCalc == meta.u8Xor8)
         {
-            LED_vFlash(LED_RED_Pin, 50);
-            if (BL_bProgramApp(&meta))
-            {
-                (void)OTA_bMarkConsumed();
-            }
-            /* On a programming failure, fall through and jump to whatever
-             * is (possibly partially) in internal flash — nothing safer
-             * to do without a golden/second bank to fall back to. */
+            BL_DBG_vPuts("programming v");
+            BL_DBG_vPutDec32(meta.u32Version);
+            BL_DBG_vPuts(" (LEDs alternating)...\r\n");
+            (void)BL_bProgramApp(&meta);
+            BL_DBG_vPuts("program done\r\n");
+            /* BKP3R is deliberately NOT touched here — only the running
+             * app is authoritative about "what's installed", so the app
+             * itself writes BKP3R in FOTA_vInit on every boot. If a reset
+             * happens before the just-programmed app writes it, this
+             * bootloader run will re-program the same image; that's
+             * idempotent and safer than the bootloader making a claim
+             * about a version it never verified was actually running. */
         }
         else
         {
-            LED_vFlash(LED_YELLOW_Pin, 50);   /* image present but XOR mismatch — skip */
+            BL_DBG_vPuts("xor mismatch (calc=0x");
+            BL_DBG_vPutHex8(u8XorCalc);
+            BL_DBG_vPuts(" stored=0x");
+            BL_DBG_vPutHex8(meta.u8Xor8);
+            BL_DBG_vPuts(") — skip\r\n");
+            LED_vFlash(LED_YELLOW_Pin, 50);
         }
     }
 
     /* Clear the app<->bootloader handoff flag either way. */
     TAMP->BKP0R = 0U;
+
+    BL_DBG_vPuts("jumping to app @0x");
+    BL_DBG_vPutHex32(OTA_APP_BASE_ADDR);
+    BL_DBG_vPuts("\r\n");
+    HAL_Delay(20);   /* let the last UART bytes drain */
 
     BL_vJumpToApp();
 
