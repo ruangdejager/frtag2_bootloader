@@ -206,22 +206,25 @@ static uint8_t OTA_u8CalcXor(uint32_t u32SizeBytes)
  * left set by the option-byte load at reset) as a prior-op failure and
  * returns HAL_ERROR without ever writing CR.
  *
- * LED heartbeat runs while erasing/programming so a bench operator can
- * see the device is actually working: yellow 50 ms on / 450 ms off, then
- * red 50 ms on / 450 ms off, alternating 1 s cycle.
+ * LED heartbeat runs while erasing/programming so a bench operator can see
+ * the device is actually working: red 20 ms on / 80 ms off, then yellow
+ * 20 ms on / 80 ms off, repeating (200 ms cycle). The XOR-verify pass right
+ * before this (see main()) lights both LEDs solid instead — visually
+ * distinct from this blink pattern, so "verifying" and "programming" don't
+ * look the same on the bench.
  * -------------------------------------------------------------------------- */
 static void BL_vLedHeartbeat(uint32_t u32NowMs, uint32_t u32StartMs)
 {
-    uint32_t u32Phase = (u32NowMs - u32StartMs) % 1000U;
-    /*   0..49    -> YELLOW on
-     *  50..499   -> both off
-     * 500..549   -> RED on
-     * 550..999   -> both off
+    uint32_t u32Phase = (u32NowMs - u32StartMs) % 200U;
+    /*   0..19   -> RED on
+     *  20..99   -> both off
+     * 100..119  -> YELLOW on
+     * 120..199  -> both off
      */
-    bool bYellowOn = (u32Phase < 50U);
-    bool bRedOn    = (u32Phase >= 500U) && (u32Phase < 550U);
-    HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin, bYellowOn ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    bool bRedOn    = (u32Phase < 20U);
+    bool bYellowOn = (u32Phase >= 100U) && (u32Phase < 120U);
     HAL_GPIO_WritePin(GPIOB, LED_RED_Pin,    bRedOn    ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin, bYellowOn ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 static bool BL_bProgramApp(const OtaMeta_t *pt)
@@ -235,7 +238,6 @@ static bool BL_bProgramApp(const OtaMeta_t *pt)
 
     while (u32Remain > 0U)
     {
-        BL_vLedHeartbeat(HAL_GetTick(), u32StartMs);
 
         uint16_t u16Chunk = (u32Remain > INTERNAL_FLASH_PAGE_SIZE)
                             ? (uint16_t)INTERNAL_FLASH_PAGE_SIZE
@@ -332,6 +334,9 @@ int main(void)
     /* Own version — separate from BKP0R/BKP1R (app<->bootloader OTA handoff). */
     TAMP->BKP2R = FRTAG_BL_VER;
 
+    HAL_GPIO_WritePin(GPIOB, LED_RED_Pin,    GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin, GPIO_PIN_SET);
+
     BL_DBG_vInit();
     BL_DBG_vPuts("\r\n--- frtag2_bootloader v");
     BL_DBG_vPutHex8(FRTAG_BL_VER);
@@ -365,13 +370,22 @@ int main(void)
 
     if (bMetaOk && meta.u32Version > u32InstalledVer)
     {
+        /* XOR verify streams the whole image over SPI (up to ~236 KB) —
+         * real time, not instant. Both LEDs solid for the duration so it
+         * reads as "busy verifying" on the bench, distinct from idle and
+         * from the programming phase's blink pattern below. */
+    	HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin,    GPIO_PIN_RESET);
         uint8_t u8XorCalc = OTA_u8CalcXor(meta.u32SizeBytes);
+        HAL_GPIO_WritePin(GPIOB, LED_RED_Pin, GPIO_PIN_RESET);
+
         if (u8XorCalc == meta.u8Xor8)
         {
+        	HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin, GPIO_PIN_SET);
             BL_DBG_vPuts("programming v");
             BL_DBG_vPutDec32(meta.u32Version);
-            BL_DBG_vPuts(" (LEDs alternating)...\r\n");
+            BL_DBG_vPuts(" (LEDs red/yellow blinking)...\r\n");
             (void)BL_bProgramApp(&meta);
+        	HAL_GPIO_WritePin(GPIOB, LED_YELLOW_Pin,    GPIO_PIN_RESET);
             BL_DBG_vPuts("program done\r\n");
             /* BKP3R is deliberately NOT touched here — only the running
              * app is authoritative about "what's installed", so the app
