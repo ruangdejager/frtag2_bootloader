@@ -132,8 +132,14 @@ typedef struct
 #define OTA_UART_RETRY_DELAY_MS   250U    /* settle time between attempts      */
 #define OTA_FWREQ_WAIT_POLL_MS    2000U   /* re-poll period on FW,WAIT         */
 #define OTA_FWREQ_WAIT_MAX_MS     90000U  /* covers fr9's own AT+FWCHECK round
-                                             trip (modem wake + PSD activate +
-                                             two HTTPS GETs)                  */
+                                             trip (GSM register + PSD activate
+                                             + manifest GET + .bin GET). The
+                                             tag_fota block was moved on the
+                                             fr9 side to run immediately after
+                                             PSD activation (before GPS work),
+                                             so this budget is now bounded by
+                                             just the cellular register + two
+                                             HTTP GETs — 90s is comfortable. */
 #define OTA_FWCHECK_ATSEND_TIMEOUT_MS 2000U
 
 /* ---- LoRa distribution (primary -> secondaries) ---- */
